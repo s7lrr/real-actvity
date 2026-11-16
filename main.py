@@ -1,520 +1,324 @@
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QSize
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QLineEdit, QTextEdit, QPushButton, QComboBox, QFileDialog,
-    QFrame, QStackedWidget, QMessageBox, QCheckBox, QSizePolicy
+    QLabel, QLineEdit, QPushButton, QFileDialog, QFrame, QMessageBox,
+    QComboBox, QScrollArea, QSplitter, QSizePolicy, QSpacerItem
 )
+from pypresence import Presence
+from pypresence.exceptions import DiscordNotFound
 
 APP_NAME = "Presence Studio"
 APP_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "PresenceStudio"
 CONFIG_FILE = APP_DIR / "settings.json"
 
-ACTIVITY_TYPES = {
-    "Playing": 0,
-    "Listening": 2,
-    "Watching": 3,
-    "Competing": 5,
-}
 
-def load_settings():
+def load_config():
     try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {"client_id": "", "presets": {}, "last": {}, **data}
     except Exception:
-        return {}
+        pass
+    return {"client_id": "", "presets": {}, "last": {}}
 
-def save_settings(data):
+
+def save_config(data):
     APP_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-class PresenceWorker(QThread):
-    done = Signal(bool, str)
 
-    def __init__(self, settings, action="apply"):
-        super().__init__()
-        self.settings = settings
-        self.action = action
-
-    def run(self):
-        rpc = None
-        try:
-            from pypresence import Presence
-            client_id = self.settings.get("client_id", "").strip()
-            if not client_id.isdigit():
-                raise ValueError("Application ID must contain numbers only.")
-            rpc = Presence(client_id)
-            rpc.connect()
-
-            if self.action == "stop":
-                rpc.clear()
-                rpc.close()
-                self.done.emit(True, "Activity cleared.")
-                return
-
-            activity = self.settings.get("activity_type", "Playing")
-            if activity not in ACTIVITY_TYPES:
-                raise ValueError("Unsupported activity type.")
-
-            payload = {
-                "details": self.settings.get("details", "").strip() or None,
-                "state": self.settings.get("state", "").strip() or None,
-                "large_image": self.settings.get("asset_key", "").strip() or None,
-                "large_text": self.settings.get("image_text", "").strip() or None,
-                "small_image": self.settings.get("small_asset_key", "").strip() or None,
-                "small_text": self.settings.get("small_image_text", "").strip() or None,
-                "buttons": self.settings.get("buttons", []),
-                "activity_type": ACTIVITY_TYPES[activity],
-            }
-            payload = {k: v for k, v in payload.items() if v is not None and v != []}
-            rpc.update(**payload)
-            rpc.close()
-            self.done.emit(True, "Rich Presence updated.")
-        except Exception as exc:
-            try:
-                if rpc:
-                    rpc.close()
-            except Exception:
-                pass
-            self.done.emit(False, str(exc))
-
-class StatCard(QFrame):
-    def __init__(self, title, description):
-        super().__init__()
-        self.setObjectName("statCard")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        t = QLabel(title)
-        t.setObjectName("cardTitle")
-        d = QLabel(description)
-        d.setObjectName("muted")
-        d.setWordWrap(True)
-        layout.addWidget(t)
-        layout.addWidget(d)
-
-class MainWindow(QMainWindow):
+class PresenceStudio(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(1080, 720)
-        self.resize(1240, 820)
-        self.settings = load_settings()
-        self.worker = None
-        self.selected_image = self.settings.get("local_image", "")
+        self.setMinimumSize(1080, 760)
+        self.resize(1360, 900)
+        self.config = load_config()
+        self.rpc = None
+        self.connected = False
+        self.image_path = ""
         self._build_ui()
-        self._load_form()
+        self._load_last()
+        self._refresh_presets()
+        self._set_status("DISCONNECTED", False)
+        self._update_preview()
 
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        outer = QHBoxLayout(central)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        self.setStyleSheet("""
+            * { font-family: 'Segoe UI'; }
+            QMainWindow, QWidget#Root { background: #0D0F13; color: #F3F4F6; }
+            QFrame#TopBar, QFrame#Panel { background: #151920; border: 1px solid #272D37; border-radius: 16px; }
+            QLabel#Brand { color: #F7F8FA; font-size: 21px; font-weight: 800; letter-spacing: 2px; }
+            QLabel#Subtle { color: #929BA9; font-size: 12px; }
+            QLabel#PageTitle { color: #F6F7F9; font-size: 25px; font-weight: 750; }
+            QLabel#SectionTitle { color: #E9ECF1; font-size: 15px; font-weight: 700; }
+            QLabel#FieldLabel { color: #C5CBD5; font-size: 12px; font-weight: 650; }
+            QLabel#Hint { color: #8792A1; font-size: 11px; }
+            QLineEdit, QComboBox { background: #0E1218; color: #F4F6F8; border: 1px solid #303846; border-radius: 10px; padding: 0 14px; min-height: 48px; font-size: 14px; selection-background-color: #6479E8; }
+            QLineEdit:focus, QComboBox:focus { border: 1px solid #8294FF; background: #111722; }
+            QLineEdit::placeholder { color: #697484; }
+            QComboBox QAbstractItemView { background: #171D26; color: #F3F4F6; selection-background-color: #394B9C; border: 1px solid #303846; padding: 6px; }
+            QPushButton { background: #202733; color: #E9EDF3; border: 1px solid #354052; border-radius: 10px; min-height: 44px; padding: 0 18px; font-size: 13px; font-weight: 650; }
+            QPushButton:hover { background: #2A3444; border-color: #52617A; }
+            QPushButton#Primary { background: #6479E8; color: white; border: 1px solid #7D8FFF; }
+            QPushButton#Primary:hover { background: #7488F2; }
+            QPushButton#Danger { background: #2B1D23; color: #F2C7D0; border: 1px solid #57333E; }
+            QPushButton#Quiet { background: transparent; border: 1px solid #303846; }
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { background: #11151B; width: 10px; margin: 4px; border-radius: 5px; }
+            QScrollBar::handle:vertical { background: #394354; min-height: 28px; border-radius: 5px; }
+            QScrollBar::handle:vertical:hover { background: #596982; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QSplitter::handle { background: #0D0F13; width: 12px; }
+        """)
 
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(224)
-        side = QVBoxLayout(sidebar)
-        side.setContentsMargins(18, 22, 18, 18)
-        side.setSpacing(12)
+        root = QWidget(); root.setObjectName("Root"); self.setCentralWidget(root)
+        outer = QVBoxLayout(root); outer.setContentsMargins(26, 22, 26, 24); outer.setSpacing(18)
 
-        brand_row = QHBoxLayout()
-        mark = QLabel("P")
-        mark.setObjectName("brandMark")
-        mark.setAlignment(Qt.AlignCenter)
-        brand = QLabel("PRESENCE\nSTUDIO")
-        brand.setObjectName("brandText")
-        brand_row.addWidget(mark)
-        brand_row.addWidget(brand)
-        brand_row.addStretch()
-        side.addLayout(brand_row)
-        side.addSpacing(26)
+        top = QFrame(); top.setObjectName("TopBar")
+        top_l = QHBoxLayout(top); top_l.setContentsMargins(22, 15, 22, 15)
+        brand_col = QVBoxLayout(); brand_col.setSpacing(3)
+        brand = QLabel("PRESENCE STUDIO"); brand.setObjectName("Brand")
+        tagline = QLabel("A better way to build your Discord profile activity"); tagline.setObjectName("Subtle")
+        brand_col.addWidget(brand); brand_col.addWidget(tagline); top_l.addLayout(brand_col)
+        top_l.addStretch()
+        self.status_pill = QLabel("●  DISCONNECTED")
+        self.status_pill.setAlignment(Qt.AlignCenter)
+        self.status_pill.setMinimumWidth(175)
+        top_l.addWidget(self.status_pill)
+        outer.addWidget(top)
 
-        nav_label = QLabel("WORKSPACE")
-        nav_label.setObjectName("navLabel")
-        side.addWidget(nav_label)
-        self.nav_activity = QPushButton("  Activity editor")
-        self.nav_activity.setObjectName("navActive")
-        self.nav_activity.setCursor(Qt.PointingHandCursor)
-        side.addWidget(self.nav_activity)
-        side.addSpacing(18)
+        splitter = QSplitter(Qt.Horizontal); splitter.setChildrenCollapsible(False)
+        outer.addWidget(splitter, 1)
 
-        nav_label2 = QLabel("INFORMATION")
-        nav_label2.setObjectName("navLabel")
-        side.addWidget(nav_label2)
-        info = QLabel("Configure your Discord Rich Presence using your own application assets.")
-        info.setObjectName("sideInfo")
-        info.setWordWrap(True)
-        side.addWidget(info)
-        side.addStretch()
+        # Wide, scrollable editor column
+        editor_scroll = QScrollArea(); editor_scroll.setWidgetResizable(True); editor_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        editor = QFrame(); editor.setObjectName("Panel")
+        form = QVBoxLayout(editor); form.setContentsMargins(26, 24, 26, 26); form.setSpacing(18)
+        title = QLabel("Create your activity"); title.setObjectName("PageTitle")
+        intro = QLabel("Fill in the details below. Your changes are saved on this computer."); intro.setObjectName("Subtle")
+        form.addWidget(title); form.addWidget(intro)
+        form.addSpacing(5)
 
-        version = QLabel("DESKTOP EDITION  •  1.1.0")
-        version.setObjectName("version")
-        side.addWidget(version)
+        form.addWidget(self._section("01", "Discord application"))
+        form.addWidget(self._field_label("APPLICATION ID"))
+        self.client_id = QLineEdit(); self.client_id.setPlaceholderText("Paste your Discord Application ID"); self.client_id.setClearButtonEnabled(True)
+        form.addWidget(self.client_id)
+        help_id = QLabel("Find this in Discord Developer Portal → Your Application → General Information."); help_id.setObjectName("Hint"); help_id.setWordWrap(True)
+        form.addWidget(help_id)
 
-        content = QWidget()
-        content.setObjectName("content")
-        main = QVBoxLayout(content)
-        main.setContentsMargins(34, 26, 34, 26)
-        main.setSpacing(20)
+        form.addWidget(self._section("02", "Activity information"))
+        grid = QGridLayout(); grid.setHorizontalSpacing(16); grid.setVerticalSpacing(12)
+        self.title_input = QLineEdit(); self.title_input.setPlaceholderText("e.g. Playing Rocket League")
+        self.description_input = QLineEdit(); self.description_input.setPlaceholderText("e.g. Ranked matches")
+        grid.addWidget(self._field_label("DETAILS / MAIN LINE"), 0, 0); grid.addWidget(self._field_label("STATE / SECOND LINE"), 0, 1)
+        grid.addWidget(self.title_input, 1, 0); grid.addWidget(self.description_input, 1, 1)
+        grid.setColumnStretch(0, 1); grid.setColumnStretch(1, 1)
+        form.addLayout(grid)
 
-        top = QHBoxLayout()
-        top_text = QVBoxLayout()
-        eyebrow = QLabel("DISCORD INTEGRATION")
-        eyebrow.setObjectName("eyebrow")
-        heading = QLabel("Activity editor")
-        heading.setObjectName("pageTitle")
-        subtitle = QLabel("Build and publish a clean Rich Presence for your Discord application.")
-        subtitle.setObjectName("muted")
-        top_text.addWidget(eyebrow)
-        top_text.addWidget(heading)
-        top_text.addWidget(subtitle)
-        top.addLayout(top_text)
-        top.addStretch()
-        self.connection_badge = QLabel("NOT CONNECTED")
-        self.connection_badge.setObjectName("statusBadge")
-        top.addWidget(self.connection_badge, 0, Qt.AlignTop)
-        main.addLayout(top)
+        form.addWidget(self._section("03", "Activity artwork"))
+        form.addWidget(self._field_label("DISCORD ASSET KEY"))
+        self.asset_input = QLineEdit(); self.asset_input.setPlaceholderText("e.g. game_cover"); self.asset_input.setClearButtonEnabled(True)
+        form.addWidget(self.asset_input)
+        art_note = QLabel("Upload the image in Developer Portal → Rich Presence → Art Assets, then enter its exact asset name here.")
+        art_note.setObjectName("Hint"); art_note.setWordWrap(True); form.addWidget(art_note)
+        local_row = QHBoxLayout()
+        self.image_path_label = QLabel("No local preview image selected"); self.image_path_label.setObjectName("Subtle"); self.image_path_label.setWordWrap(True)
+        local_row.addWidget(self.image_path_label, 1)
+        choose = QPushButton("Choose preview image"); choose.clicked.connect(self._choose_image); local_row.addWidget(choose)
+        form.addLayout(local_row)
+        local_note = QLabel("A local image is only for the preview in this app. It is not uploaded to Discord."); local_note.setObjectName("Hint"); form.addWidget(local_note)
 
-        cards = QHBoxLayout()
-        cards.setSpacing(12)
-        cards.addWidget(StatCard("One application", "Use one Application ID that you own and manage."))
-        cards.addWidget(StatCard("Local image preview", "Choose an image from your computer to preview it here."))
-        cards.addWidget(StatCard("Saved settings", "Your configuration is stored locally on this Windows account."))
-        main.addLayout(cards)
+        form.addWidget(self._section("04", "Optional profile button"))
+        grid2 = QGridLayout(); grid2.setHorizontalSpacing(16); grid2.setVerticalSpacing(12)
+        self.button_text = QLineEdit(); self.button_text.setPlaceholderText("e.g. Visit website")
+        self.button_url = QLineEdit(); self.button_url.setPlaceholderText("https://example.com")
+        grid2.addWidget(self._field_label("BUTTON LABEL"), 0, 0); grid2.addWidget(self._field_label("BUTTON URL"), 0, 1)
+        grid2.addWidget(self.button_text, 1, 0); grid2.addWidget(self.button_url, 1, 1)
+        grid2.setColumnStretch(0, 1); grid2.setColumnStretch(1, 1); form.addLayout(grid2)
 
-        body = QHBoxLayout()
-        body.setSpacing(18)
+        form.addWidget(self._section("05", "Your saved presets"))
+        preset_row = QHBoxLayout(); self.preset_combo = QComboBox(); self.preset_combo.addItem("Select a saved preset")
+        self.preset_combo.currentTextChanged.connect(self._load_preset); preset_row.addWidget(self.preset_combo, 1)
+        save = QPushButton("Save current preset"); save.clicked.connect(self._save_preset); preset_row.addWidget(save)
+        delete = QPushButton("Delete"); delete.setObjectName("Quiet"); delete.clicked.connect(self._delete_preset); preset_row.addWidget(delete)
+        form.addLayout(preset_row)
 
-        editor = QFrame()
-        editor.setObjectName("panel")
-        editor_layout = QVBoxLayout(editor)
-        editor_layout.setContentsMargins(22, 20, 22, 22)
-        editor_layout.setSpacing(13)
+        actions = QHBoxLayout(); actions.setSpacing(10)
+        self.connect_btn = QPushButton("Connect Discord"); self.connect_btn.clicked.connect(self._connect); actions.addWidget(self.connect_btn)
+        self.apply_btn = QPushButton("Start / Update Presence"); self.apply_btn.setObjectName("Primary"); self.apply_btn.clicked.connect(self._apply); actions.addWidget(self.apply_btn, 1)
+        self.stop_btn = QPushButton("Stop Activity"); self.stop_btn.setObjectName("Danger"); self.stop_btn.clicked.connect(self._stop_presence); actions.addWidget(self.stop_btn)
+        form.addSpacing(6); form.addLayout(actions)
+        editor_scroll.setWidget(editor); splitter.addWidget(editor_scroll)
 
-        section = QLabel("PRESENCE CONFIGURATION")
-        section.setObjectName("sectionLabel")
-        editor_layout.addWidget(section)
+        # Preview column
+        right = QFrame(); right.setObjectName("Panel")
+        preview = QVBoxLayout(right); preview.setContentsMargins(22, 24, 22, 24); preview.setSpacing(16)
+        ptitle = QLabel("Profile preview"); ptitle.setObjectName("PageTitle"); preview.addWidget(ptitle)
+        psub = QLabel("A live approximation of how your activity may appear on Discord."); psub.setObjectName("Subtle"); psub.setWordWrap(True); preview.addWidget(psub)
+        preview.addSpacing(20)
+        discord = QFrame(); discord.setStyleSheet("QFrame{background:#23262D;border:1px solid #3A3F49;border-radius:16px;}")
+        dc = QVBoxLayout(discord); dc.setContentsMargins(18, 18, 18, 18); dc.setSpacing(14)
+        over = QLabel("PLAYING A GAME"); over.setStyleSheet("color:#B6BBC5;font-size:10px;font-weight:800;letter-spacing:1.5px;"); dc.addWidget(over)
+        body = QHBoxLayout(); body.setSpacing(14)
+        self.preview_image = QLabel("IMAGE"); self.preview_image.setFixedSize(104, 104); self.preview_image.setAlignment(Qt.AlignCenter)
+        self.preview_image.setStyleSheet("background:#343A45;border:1px solid #4A5260;border-radius:12px;color:#929BA9;font-size:11px;font-weight:700;")
+        body.addWidget(self.preview_image, 0, Qt.AlignTop)
+        text_col = QVBoxLayout(); text_col.setSpacing(8)
+        self.preview_title = QLabel("Activity title"); self.preview_title.setWordWrap(True); self.preview_title.setStyleSheet("color:#FFFFFF;font-size:16px;font-weight:750;")
+        self.preview_description = QLabel("Activity state or description"); self.preview_description.setWordWrap(True); self.preview_description.setStyleSheet("color:#C3C8D1;font-size:13px;")
+        elapsed = QLabel("00:00 elapsed"); elapsed.setStyleSheet("color:#929BA9;font-size:11px;")
+        text_col.addWidget(self.preview_title); text_col.addWidget(self.preview_description); text_col.addWidget(elapsed); text_col.addStretch()
+        body.addLayout(text_col, 1); dc.addLayout(body)
+        self.preview_button = QLabel("No button configured"); self.preview_button.setAlignment(Qt.AlignCenter)
+        self.preview_button.setStyleSheet("background:#3B414D;color:#F1F3F6;border-radius:9px;padding:12px;font-weight:700;"); dc.addWidget(self.preview_button)
+        preview.addWidget(discord)
+        preview.addSpacing(10)
+        info = QFrame(); info.setStyleSheet("QFrame{background:#111720;border:1px solid #293444;border-radius:12px;}")
+        il = QVBoxLayout(info); il.setContentsMargins(15, 15, 15, 15); il.setSpacing(7)
+        inf_title = QLabel("BEFORE YOU START"); inf_title.setStyleSheet("color:#AEBBFF;font-size:11px;font-weight:800;letter-spacing:1px;")
+        inf_body = QLabel("1. Open Discord Desktop.\n2. Create an app in the Developer Portal.\n3. Upload your artwork as a Rich Presence asset.\n4. Connect, then start your activity.")
+        inf_body.setObjectName("Subtle"); inf_body.setWordWrap(True); inf_body.setStyleSheet("color:#AAB3C1;font-size:12px;line-height:1.5;")
+        il.addWidget(inf_title); il.addWidget(inf_body); preview.addWidget(info)
+        preview.addStretch()
+        footer = QLabel("Presence Studio  •  Local settings only"); footer.setObjectName("Hint"); preview.addWidget(footer)
+        splitter.addWidget(right); splitter.setSizes([820, 420]); splitter.setStretchFactor(0, 2); splitter.setStretchFactor(1, 1)
 
-        self.client_id = self._add_field(editor_layout, "Application ID", "Enter your Discord Application ID")
-        id_row = QHBoxLayout()
-        id_row.addWidget(self.client_id, 1)
-        self.portal_btn = QPushButton("Open Developer Portal")
-        self.portal_btn.setObjectName("secondaryButton")
-        self.portal_btn.clicked.connect(self.open_portal)
-        id_row.addWidget(self.portal_btn)
-        # Move the input out of its original row and place it in the combined row.
-        editor_layout.removeWidget(self.client_id)
-        editor_layout.addLayout(id_row)
+        for widget in [self.title_input, self.description_input, self.asset_input, self.button_text, self.button_url]:
+            widget.textChanged.connect(self._update_preview)
 
-        self.activity_type = QComboBox()
-        self.activity_type.addItems(["Playing", "Watching", "Listening", "Competing"])
-        self._field_label(editor_layout, "Activity type")
-        editor_layout.addWidget(self.activity_type)
+    def _section(self, number, text):
+        label = QLabel(f"{number}   {text}"); label.setObjectName("SectionTitle")
+        label.setStyleSheet("color:#E7EAF0;font-size:15px;font-weight:750;padding-top:5px;border-bottom:1px solid #29313D;padding-bottom:9px;")
+        return label
 
-        self.details = self._add_field(editor_layout, "Title / details", "For example: Beyond the ordinary.")
-        self.state = self._add_field(editor_layout, "Description / state", "For example: Living in my own world")
+    def _field_label(self, text):
+        label = QLabel(text); label.setObjectName("FieldLabel"); return label
 
-        divider = QFrame()
-        divider.setObjectName("divider")
-        divider.setFixedHeight(1)
-        editor_layout.addWidget(divider)
-
-        image_head = QHBoxLayout()
-        image_title = QLabel("LARGE IMAGE")
-        image_title.setObjectName("sectionLabel")
-        image_head.addWidget(image_title)
-        image_head.addStretch()
-        self.choose_image_btn = QPushButton("Choose local image")
-        self.choose_image_btn.setObjectName("secondaryButton")
-        self.choose_image_btn.clicked.connect(self.choose_image)
-        image_head.addWidget(self.choose_image_btn)
-        editor_layout.addLayout(image_head)
-
-        self.asset_key = self._add_field(editor_layout, "Discord asset key", "Exact asset name uploaded in Developer Portal")
-        self.image_text = self._add_field(editor_layout, "Image hover text", "Optional text shown when hovering over the image")
-        self.local_path_label = QLabel("No local preview image selected.")
-        self.local_path_label.setObjectName("mutedSmall")
-        self.local_path_label.setWordWrap(True)
-        editor_layout.addWidget(self.local_path_label)
-
-        self.advanced_toggle = QCheckBox("Show small image and button settings")
-        self.advanced_toggle.setObjectName("check")
-        self.advanced_toggle.stateChanged.connect(self.toggle_advanced)
-        editor_layout.addWidget(self.advanced_toggle)
-
-        self.advanced = QWidget()
-        adv = QVBoxLayout(self.advanced)
-        adv.setContentsMargins(0, 0, 0, 0)
-        adv.setSpacing(10)
-        self.small_asset_key = self._add_field(adv, "Small image asset key", "Optional second asset key")
-        self.small_image_text = self._add_field(adv, "Small image hover text", "Optional")
-        self.button_label = self._add_field(adv, "Button label", "For example: Visit website")
-        self.button_url = self._add_field(adv, "Button URL", "https://example.com")
-        editor_layout.addWidget(self.advanced)
-        self.advanced.hide()
-
-        action_row = QHBoxLayout()
-        self.save_btn = QPushButton("Save settings")
-        self.save_btn.setObjectName("secondaryButton")
-        self.save_btn.clicked.connect(self.save_only)
-        self.apply_btn = QPushButton("Apply Rich Presence")
-        self.apply_btn.setObjectName("primaryButton")
-        self.apply_btn.clicked.connect(self.apply_presence)
-        self.stop_btn = QPushButton("Stop activity")
-        self.stop_btn.setObjectName("dangerButton")
-        self.stop_btn.clicked.connect(self.stop_presence)
-        action_row.addWidget(self.save_btn)
-        action_row.addStretch()
-        action_row.addWidget(self.stop_btn)
-        action_row.addWidget(self.apply_btn)
-        editor_layout.addLayout(action_row)
-
-        preview = QFrame()
-        preview.setObjectName("previewPanel")
-        preview.setFixedWidth(310)
-        pv = QVBoxLayout(preview)
-        pv.setContentsMargins(18, 20, 18, 20)
-        pv.setSpacing(14)
-        pv_head = QHBoxLayout()
-        pv_label = QLabel("LIVE PREVIEW")
-        pv_label.setObjectName("sectionLabel")
-        pv_head.addWidget(pv_label)
-        pv_head.addStretch()
-        preview_tag = QLabel("LOCAL")
-        preview_tag.setObjectName("localTag")
-        pv_head.addWidget(preview_tag)
-        pv.addLayout(pv_head)
-
-        self.preview_image = QLabel()
-        self.preview_image.setObjectName("previewImage")
-        self.preview_image.setAlignment(Qt.AlignCenter)
-        self.preview_image.setFixedSize(272, 180)
-        self.preview_image.setText("IMAGE PREVIEW")
-        pv.addWidget(self.preview_image, 0, Qt.AlignHCenter)
-
-        self.preview_type = QLabel("PLAYING")
-        self.preview_type.setObjectName("previewType")
-        pv.addWidget(self.preview_type)
-        self.preview_title = QLabel("Your activity title")
-        self.preview_title.setObjectName("previewTitle")
-        self.preview_title.setWordWrap(True)
-        pv.addWidget(self.preview_title)
-        self.preview_desc = QLabel("Your activity description")
-        self.preview_desc.setObjectName("muted")
-        self.preview_desc.setWordWrap(True)
-        pv.addWidget(self.preview_desc)
-
-        note = QFrame()
-        note.setObjectName("noteBox")
-        note_layout = QVBoxLayout(note)
-        note_layout.setContentsMargins(12, 12, 12, 12)
-        note_title = QLabel("Important")
-        note_title.setObjectName("noteTitle")
-        note_text = QLabel("A local image is only used for preview. To show an image to other Discord users, upload it as an Application Asset and enter its exact asset key.")
-        note_text.setObjectName("mutedSmall")
-        note_text.setWordWrap(True)
-        note_layout.addWidget(note_title)
-        note_layout.addWidget(note_text)
-        pv.addStretch()
-        pv.addWidget(note)
-
-        body.addWidget(editor, 1)
-        body.addWidget(preview)
-        main.addLayout(body, 1)
-
-        outer.addWidget(sidebar)
-        outer.addWidget(content, 1)
-
-        self.activity_type.currentTextChanged.connect(self.refresh_preview)
-        self.details.textChanged.connect(self.refresh_preview)
-        self.state.textChanged.connect(self.refresh_preview)
-        self.refresh_preview()
-
-    def _field_label(self, layout, text):
-        label = QLabel(text)
-        label.setObjectName("fieldLabel")
-        layout.addWidget(label)
-
-    def _add_field(self, layout, label, placeholder):
-        self._field_label(layout, label)
-        field = QLineEdit()
-        field.setPlaceholderText(placeholder)
-        field.setMinimumHeight(40)
-        field.setObjectName("input")
-        layout.addWidget(field)
-        return field
-
-    def _load_form(self):
-        s = self.settings
-        self.client_id.setText(s.get("client_id", ""))
-        self.activity_type.setCurrentText(s.get("activity_type", "Playing"))
-        self.details.setText(s.get("details", ""))
-        self.state.setText(s.get("state", ""))
-        self.asset_key.setText(s.get("asset_key", ""))
-        self.image_text.setText(s.get("image_text", ""))
-        self.small_asset_key.setText(s.get("small_asset_key", ""))
-        self.small_image_text.setText(s.get("small_image_text", ""))
-        self.button_label.setText(s.get("button_label", ""))
-        self.button_url.setText(s.get("button_url", ""))
-        self.selected_image = s.get("local_image", "")
-        if self.selected_image and Path(self.selected_image).exists():
-            self._show_image(self.selected_image)
-        self.refresh_preview()
-
-    def collect_settings(self):
-        buttons = []
-        label = self.button_label.text().strip()
-        url = self.button_url.text().strip()
-        if label and url:
-            buttons = [{"label": label[:32], "url": url}]
-        return {
-            "client_id": self.client_id.text().strip(),
-            "activity_type": self.activity_type.currentText(),
-            "details": self.details.text().strip(),
-            "state": self.state.text().strip(),
-            "asset_key": self.asset_key.text().strip(),
-            "image_text": self.image_text.text().strip(),
-            "small_asset_key": self.small_asset_key.text().strip(),
-            "small_image_text": self.small_image_text.text().strip(),
-            "button_label": label,
-            "button_url": url,
-            "buttons": buttons,
-            "local_image": self.selected_image,
-        }
-
-    def save_only(self):
-        self.settings = self.collect_settings()
-        save_settings(self.settings)
-        self.set_status("SAVED LOCALLY", True)
-        QMessageBox.information(self, "Settings saved", "Your settings have been saved on this computer.")
-
-    def apply_presence(self):
-        data = self.collect_settings()
-        if not data["client_id"]:
-            QMessageBox.warning(self, "Application ID required", "Enter your Discord Application ID first.")
-            return
-        if data["button_label"] and data["button_url"] and not data["button_url"].startswith(("https://", "http://")):
-            QMessageBox.warning(self, "Invalid button URL", "Button URL must start with http:// or https://.")
-            return
-        self.settings = data
-        save_settings(data)
-        self._run_worker(data, "apply")
-
-    def stop_presence(self):
-        data = self.collect_settings()
-        if not data["client_id"]:
-            QMessageBox.warning(self, "Application ID required", "Enter your Discord Application ID to clear this application's activity.")
-            return
-        self._run_worker(data, "stop")
-
-    def _run_worker(self, data, action):
-        if self.worker and self.worker.isRunning():
-            QMessageBox.information(self, "Please wait", "An operation is already running.")
-            return
-        self.apply_btn.setEnabled(False)
-        self.stop_btn.setEnabled(False)
-        self.set_status("CONNECTING", False)
-        self.worker = PresenceWorker(data, action)
-        self.worker.done.connect(self._worker_done)
-        self.worker.start()
-
-    def _worker_done(self, ok, message):
-        self.apply_btn.setEnabled(True)
-        self.stop_btn.setEnabled(True)
-        self.set_status("CONNECTED" if ok else "NOT CONNECTED", ok)
+    def _set_status(self, text, ok):
         if ok:
-            QMessageBox.information(self, "Presence Studio", message)
+            style = "background:#172B24;color:#9BE0B5;border:1px solid #2D5943;border-radius:11px;padding:10px 14px;font-size:11px;font-weight:800;"
         else:
-            QMessageBox.critical(self, "Could not update activity", message + "\n\nMake sure the Discord desktop app is running and the Application ID is correct.")
+            style = "background:#242832;color:#B8C0CD;border:1px solid #3A4352;border-radius:11px;padding:10px 14px;font-size:11px;font-weight:800;"
+        self.status_pill.setText("●  " + text); self.status_pill.setStyleSheet(style)
 
-    def set_status(self, text, ok):
-        self.connection_badge.setText(text)
-        self.connection_badge.setProperty("good", bool(ok))
-        self.connection_badge.style().unpolish(self.connection_badge)
-        self.connection_badge.style().polish(self.connection_badge)
-
-    def choose_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Choose preview image", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+    def _choose_image(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose preview image", "", "Images (*.png *.jpg *.jpeg *.webp)")
         if path:
-            self.selected_image = path
-            self._show_image(path)
+            self.image_path = path; self.image_path_label.setText(Path(path).name); self._update_preview()
 
-    def _show_image(self, path):
-        pix = QPixmap(path)
-        if not pix.isNull():
-            self.preview_image.setPixmap(pix.scaled(self.preview_image.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
-            self.local_path_label.setText(Path(path).name)
+    def _update_preview(self):
+        self.preview_title.setText(self.title_input.text().strip() or "Activity title")
+        self.preview_description.setText(self.description_input.text().strip() or "Activity state or description")
+        self.preview_button.setText(self.button_text.text().strip() or "No button configured")
+        if self.image_path and Path(self.image_path).exists():
+            pix = QPixmap(self.image_path)
+            if not pix.isNull():
+                self.preview_image.setPixmap(pix.scaled(104, 104, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)); self.preview_image.setText("")
+                return
+        self.preview_image.setPixmap(QPixmap()); self.preview_image.setText("IMAGE")
 
-    def toggle_advanced(self, state):
-        self.advanced.setVisible(bool(state))
+    def _form_data(self):
+        return {"client_id": self.client_id.text().strip(), "title": self.title_input.text().strip(),
+                "description": self.description_input.text().strip(), "asset_key": self.asset_input.text().strip(),
+                "button_text": self.button_text.text().strip(), "button_url": self.button_url.text().strip(),
+                "image_path": self.image_path}
 
-    def refresh_preview(self, *_):
-        self.preview_type.setText(self.activity_type.currentText().upper())
-        self.preview_title.setText(self.details.text().strip() or "Your activity title")
-        self.preview_desc.setText(self.state.text().strip() or "Your activity description")
+    def _apply_data(self, data):
+        self.client_id.setText(data.get("client_id", "")); self.title_input.setText(data.get("title", ""))
+        self.description_input.setText(data.get("description", "")); self.asset_input.setText(data.get("asset_key", ""))
+        self.button_text.setText(data.get("button_text", "")); self.button_url.setText(data.get("button_url", ""))
+        self.image_path = data.get("image_path", "")
+        self.image_path_label.setText(Path(self.image_path).name if self.image_path else "No local preview image selected")
+        self._update_preview()
 
-    def open_portal(self):
-        from PySide6.QtGui import QDesktopServices
-        from PySide6.QtCore import QUrl
-        QDesktopServices.openUrl(QUrl("https://discord.com/developers/applications"))
+    def _load_last(self): self._apply_data(self.config.get("last", {}))
 
-def apply_style(app):
-    app.setStyleSheet("""
-    QWidget { color: #e8ebf1; font-family: "Segoe UI"; font-size: 10pt; }
-    QMainWindow { background: #0b0e13; }
-    #sidebar { background: #0e1219; border-right: 1px solid #202733; }
-    #brandMark { background: #dce5f2; color: #10151d; border-radius: 10px; font-size: 18pt; font-weight: 800; min-width: 42px; max-width: 42px; min-height: 42px; max-height: 42px; }
-    #brandText { font-size: 10pt; font-weight: 800; letter-spacing: 1.5px; line-height: 1.2; }
-    #navLabel, #sectionLabel, #eyebrow { color: #8793a5; font-size: 8pt; font-weight: 700; letter-spacing: 1.5px; }
-    #navActive { text-align: left; color: #f4f6fa; background: #202a38; border: 1px solid #2b3a4d; border-radius: 8px; padding: 12px; font-weight: 600; }
-    #sideInfo, #muted, #mutedSmall { color: #909bad; }
-    #sideInfo { font-size: 9pt; line-height: 1.5; }
-    #mutedSmall { font-size: 8pt; }
-    #version { color: #657184; font-size: 7.5pt; letter-spacing: 1px; }
-    #content { background: #0b0e13; }
-    #pageTitle { font-size: 25pt; font-weight: 750; color: #f5f7fb; }
-    #statusBadge { background: #242b36; color: #aeb8c8; border: 1px solid #354052; border-radius: 12px; padding: 7px 11px; font-size: 8pt; font-weight: 700; }
-    #statusBadge[good="true"] { background: #142b25; color: #8dd8b5; border-color: #24543f; }
-    #statCard, #panel, #previewPanel { background: #121821; border: 1px solid #222d3b; border-radius: 12px; }
-    #cardTitle { font-weight: 700; color: #edf1f7; }
-    #panel { background: #111720; }
-    #previewPanel { background: #101720; }
-    #fieldLabel { color: #b9c3d1; font-size: 9pt; font-weight: 600; margin-top: 2px; }
-    #input, QComboBox { background: #0b1119; border: 1px solid #2a3544; border-radius: 7px; padding: 8px 10px; color: #eef2f7; selection-background-color: #506b91; }
-    #input:focus, QComboBox:focus { border: 1px solid #7894bb; }
-    QComboBox::drop-down { border: 0; width: 25px; }
-    QComboBox QAbstractItemView { background: #151d28; selection-background-color: #344b68; border: 1px solid #2a3544; }
-    QPushButton { border-radius: 7px; padding: 10px 13px; font-weight: 650; }
-    #primaryButton { background: #dce5f2; color: #101720; border: 1px solid #e8edf5; }
-    #primaryButton:hover { background: #ffffff; }
-    #secondaryButton { background: #202a37; color: #e3e9f1; border: 1px solid #354356; }
-    #secondaryButton:hover { background: #293648; }
-    #dangerButton { background: #2b2024; color: #e6b9c0; border: 1px solid #55333c; }
-    #dangerButton:hover { background: #3a252c; }
-    #divider { background: #283342; }
-    #previewImage { background: #0a1017; color: #68768a; border: 1px dashed #344255; border-radius: 9px; font-size: 8pt; font-weight: 700; }
-    #previewType { color: #9eabc0; font-size: 8pt; font-weight: 800; letter-spacing: 1.5px; }
-    #previewTitle { color: #f4f6fa; font-size: 13pt; font-weight: 750; }
-    #localTag { color: #9eb4d0; background: #1d2b3c; border-radius: 8px; padding: 4px 7px; font-size: 7pt; font-weight: 700; }
-    #noteBox { background: #172230; border: 1px solid #2c4057; border-radius: 9px; }
-    #noteTitle { color: #cbd8e8; font-weight: 700; }
-    QCheckBox { color: #bdc7d5; spacing: 8px; }
-    QCheckBox::indicator { width: 15px; height: 15px; }
-    """)
+    def _persist(self):
+        self.config["last"] = self._form_data(); save_config(self.config)
 
-def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    app.setFont(QFont("Segoe UI", 10))
-    apply_style(app)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    def _connect(self):
+        client_id = self.client_id.text().strip()
+        if not client_id.isdigit():
+            QMessageBox.warning(self, "Application ID required", "Enter the numeric Application ID from the Discord Developer Portal."); return
+        try:
+            if self.rpc:
+                try: self.rpc.close()
+                except Exception: pass
+            self.rpc = Presence(client_id); self.rpc.connect(); self.connected = True
+            self.connect_btn.setText("Reconnect Discord"); self._set_status("CONNECTED TO DISCORD", True); self._persist()
+        except DiscordNotFound:
+            self.connected = False; self.rpc = None; self._set_status("DISCORD NOT FOUND", False)
+            QMessageBox.warning(self, "Discord not found", "Open the Discord Desktop application, then try connecting again.")
+        except Exception as exc:
+            self.connected = False; self.rpc = None; self._set_status("CONNECTION FAILED", False)
+            QMessageBox.critical(self, "Connection error", f"Could not connect to Discord.\n\n{exc}")
+
+    def _apply(self):
+        if not self.connected or not self.rpc:
+            QMessageBox.information(self, "Connect first", "Connect to Discord before starting your activity."); return
+        data = self._form_data()
+        if not data["title"] and not data["description"]:
+            QMessageBox.warning(self, "Activity details missing", "Enter a main line or a state before continuing."); return
+        if data["button_url"] and not data["button_url"].startswith(("https://", "http://")):
+            QMessageBox.warning(self, "Invalid URL", "The button URL must start with http:// or https://."); return
+        kwargs = {"details": data["title"] or None, "state": data["description"] or None, "start": int(time.time())}
+        if data["asset_key"]: kwargs["large_image"] = data["asset_key"]
+        if data["button_text"] and data["button_url"]: kwargs["buttons"] = [{"label": data["button_text"][:32], "url": data["button_url"]}]
+        try:
+            self.rpc.update(**kwargs); self._persist(); self._set_status("ACTIVITY IS RUNNING", True)
+            QMessageBox.information(self, "Activity started", "Your Discord Rich Presence has been updated. Keep Presence Studio running.")
+        except Exception as exc:
+            self._set_status("UPDATE FAILED", False); QMessageBox.critical(self, "Update failed", f"Discord did not accept the activity.\n\n{exc}")
+
+    def _stop_presence(self):
+        if not self.rpc or not self.connected:
+            self._set_status("DISCONNECTED", False); return
+        try:
+            self.rpc.clear(); self._set_status("ACTIVITY STOPPED", False)
+        except Exception as exc: QMessageBox.warning(self, "Could not stop activity", str(exc))
+
+    def _save_preset(self):
+        data = self._form_data()
+        if not data["title"] and not data["description"]:
+            QMessageBox.warning(self, "Empty preset", "Add activity details before saving a preset."); return
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
+        if not ok or not name.strip(): return
+        self.config.setdefault("presets", {})[name.strip()] = data; self._persist(); save_config(self.config)
+        self._refresh_presets(); self.preset_combo.setCurrentText(name.strip())
+
+    def _refresh_presets(self):
+        current = self.preset_combo.currentText() if hasattr(self, "preset_combo") else ""
+        self.preset_combo.blockSignals(True); self.preset_combo.clear(); self.preset_combo.addItem("Select a saved preset")
+        for name in sorted(self.config.get("presets", {}).keys()): self.preset_combo.addItem(name)
+        if current: self.preset_combo.setCurrentText(current)
+        self.preset_combo.blockSignals(False)
+
+    def _load_preset(self, name):
+        data = self.config.get("presets", {}).get(name)
+        if data: self._apply_data(data)
+
+    def _delete_preset(self):
+        name = self.preset_combo.currentText()
+        if name in self.config.get("presets", {}):
+            del self.config["presets"][name]; save_config(self.config); self._refresh_presets()
+
+    def closeEvent(self, event):
+        self._persist()
+        if self.rpc:
+            try: self.rpc.close()
+            except Exception: pass
+        event.accept()
+
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setFont(QFont("Segoe UI", 10))
+    window = PresenceStudio(); window.show(); sys.exit(app.exec())

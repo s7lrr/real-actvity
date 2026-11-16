@@ -1,19 +1,20 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+echo Installing build requirements...
+py -m pip install --upgrade pip
+if errorlevel 1 goto error
+py -m pip install -r requirements.txt
+if errorlevel 1 goto error
 echo Building Presence Studio...
-py -3 -m venv .venv
-call .venv\Scripts\activate.bat
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-pip install pyinstaller
-pyinstaller --noconfirm --clean --windowed --onefile --name PresenceStudio main.py
-if errorlevel 1 (
-  echo Build failed.
-  pause
-  exit /b 1
-)
+py -m PyInstaller --noconfirm --clean --windowed --onefile --name PresenceStudio --collect-all pypresence main.py
+if errorlevel 1 goto error
 echo.
 echo Build complete: dist\PresenceStudio.exe
-echo The executable includes its Python dependencies.
 pause
+exit /b 0
+:error
+echo.
+echo Build failed. Check the error messages above.
+pause
+exit /b 1

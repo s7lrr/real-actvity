@@ -1,43 +1,92 @@
 # Presence Studio
 
-A simple desktop application for managing your Discord Rich Presence.
+A Windows desktop app for creating a Discord Rich Presence activity and previewing its layout before publishing it to your profile.
 
-## Download
+## Download and install
 
-[Download Presence Studio](https://github.com/s7lrr/real-actvity/releases/tag/discord)
+1. Open the [latest release](https://github.com/s7lrr/real-actvity/releases).
+2. Under **Assets**, download `PresenceStudio-Setup.exe`.
+3. Double-click the installer and follow the steps.
+4. Launch **Presence Studio** from the Desktop shortcut or Start Menu.
 
-## Installation
+You do not need to install Python or any programming libraries when using the setup installer.
 
-1. Open the download link above.
-2. Scroll down to the **Assets** section.
-3. Download `PresenceStudio-Setup.exe`.
-4. Run the installer.
-5. Follow the installation steps.
-6. Open Presence Studio.
+## First-time Discord setup
 
-## How to Use
+### 1. Create your Discord application
 
-1. Launch Presence Studio.
-2. Enter your Discord Application ID.
-3. Customize your activity details.
-4. Add your images and configure your presence.
-5. Click **Start Presence**.
-6. Keep the application running while using Discord.
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications).
+2. Select **New Application** and give it a name.
+3. Open **General Information** and copy the **Application ID**.
+4. Paste that number into the Application ID field in Presence Studio.
 
-## Requirements
+![Create an application and copy its Application ID](examples/02-discord-setup-guide.svg)
 
-- Windows 10 or Windows 11.
-- Discord Desktop.
-- Internet connection.
+### 2. Upload your activity image
 
-## Screenshots
+1. Open your application in the Developer Portal.
+2. Go to **Rich Presence** and then **Art Assets**.
+3. Upload the image you want Discord to display.
+4. Copy the asset's exact key/name.
+5. Paste that key into **Discord Asset Key** in Presence Studio.
 
-### Example 1
-![Example 1](examples/example-1.png)
+The **Choose preview image** button only displays a local preview inside Presence Studio. It does not upload the image to Discord. Discord displays the image uploaded to your application's Art Assets.
 
-### Example 2
-![Example 2](examples/example-2.png)
+### 3. Create and publish your activity
+
+1. Open the Discord **Desktop** application and sign in.
+2. Keep Discord running in the background.
+3. Open Presence Studio.
+4. Paste your Application ID.
+5. Enter your main activity line in **Details / Main Line**.
+6. Enter the second line in **State / Second Line**.
+7. Add your Discord asset key if you want an image.
+8. Optionally add a button label and a valid `https://` URL.
+9. Click **Connect Discord**.
+10. Click **Start / Update Presence**.
+11. Open your Discord profile to view the activity. Keep Presence Studio running while you want the activity to remain active.
+
+![Presence Studio editor and preview](examples/01-editor-guide.svg)
+
+## What the fields mean
+
+| Field | Purpose |
+|---|---|
+| Application ID | Identifies your Discord Developer Portal application. |
+| Details / Main Line | The primary line shown in your activity. |
+| State / Second Line | The secondary line shown below the primary line. |
+| Discord Asset Key | The exact name of an image uploaded under your application's Art Assets. |
+| Choose preview image | Shows a local-only preview in this app; it is not sent to Discord. |
+| Button Label and URL | Optional activity button. Both fields must be filled in to show it. |
+
+## Saved presets
+
+Use **Save current preset** to save your current activity settings on this computer. Select a saved preset to load it again. Presets and the last-used settings are stored locally in `%APPDATA%\PresenceStudio\settings.json`.
+
+## Troubleshooting
+
+- **Discord not found:** Open the Discord Desktop app, then click **Connect Discord** again. The browser version is not sufficient for the local RPC connection.
+- **Image not visible:** Confirm that the image was uploaded under Rich Presence → Art Assets and that the asset key matches exactly.
+- **Activity not visible on your profile:** Check Discord activity privacy settings and make sure Presence Studio remains open.
+- **Button not visible:** Enter both a button label and a valid `https://` or `http://` URL.
+
+## Important limitations
+
+- This application uses Discord's local desktop RPC connection. It does not set custom Rich Presence from the Discord mobile app.
+- It does not request your Discord password, account token, or browser cookies.
+- It cannot force Discord's separate Go Live / Streaming card to appear. It publishes a Rich Presence activity.
+
+## Build from source
+
+For developers who want to build the application themselves:
+
+1. Install Python 3.10 or newer on Windows.
+2. Open this project folder in File Explorer.
+3. Double-click `build.bat`.
+4. The executable will be created at `dist\PresenceStudio.exe`.
+
+To create the Windows installer manually, install Inno Setup and compile `installer\PresenceStudio.iss` after building the executable.
 
 ## Support
 
-For issues or suggestions, open an issue in this repository.
+Report bugs or request improvements through the repository's [Issues](https://github.com/s7lrr/real-actvity/issues) page.
